@@ -17,15 +17,27 @@ limitations under the License.
 package create
 
 import (
+	"context"
+	"fmt"
+	"strconv"
+	
 	"github.com/spf13/cobra"
 
-	v1 "k8s.io/api/core/v1"
+	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/cli-runtime/pkg/resource"
+	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
-	"k8s.io/kubectl/pkg/generate"
-	generateversioned "k8s.io/kubectl/pkg/generate/versioned"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/kubectl/pkg/scheme"
+	"k8s.io/kubectl/pkg/util"
 	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/templates"
+	"k8s.io/kubectl/pkg/generate"
+	generateversioned "k8s.io/kubectl/pkg/generate/versioned"
 )
 
 // NewCmdCreateService is a macro command to create a new service
@@ -69,14 +81,14 @@ type ServiceClusterIPOpts struct {
 	// Name of resource being created
 	Name             string
 	DefaultName      string
-	Selector         string
+	Selector         map[string]string
 	// Port will be used if a user specifies --port OR the exposed object
 	// has one port
 	Port             string
 	// Ports will be used if a user doesn't specify --port AND the
 	// exposed object has multiple ports
-	Ports            string
-	Labels           string
+	Ports            []v1.ServicePort
+	Labels           map[string]string
 	ExternalIP       string
 	LoadBalancerIP   string
 	Type             string
@@ -92,7 +104,7 @@ type ServiceClusterIPOpts struct {
 	ClusterIP        string
 	
 	DryRunStrategy   cmdutil.DryRunStrategy
-	DryRunVerifier   *resourcecli.DryRunVerifier
+	DryRunVerifier   *resource.DryRunVerifier
 	CreateAnnotation bool
 	FieldManager     string
 
@@ -147,7 +159,8 @@ func errUnsupportedGenerator(cmd *cobra.Command, generatorName string) error {
 
 // Complete completes all the required options
 func (o *ServiceClusterIPOpts) Complete(f cmdutil.Factory, cmd *cobra.Command, args []string) error {
-	name, err := NameFromCommandArgs(cmd, args)
+	var err error
+	o.Name, err = NameFromCommandArgs(cmd, args)
 	if err != nil {
 		return err
 	}
@@ -176,7 +189,7 @@ func (o *ServiceClusterIPOpts) Complete(f cmdutil.Factory, cmd *cobra.Command, a
 	if err != nil {
 		return err
 	}
-	o.DryRunVerifier = resourcecli.NewDryRunVerifier(dynamicClient, discoveryClient)
+	o.DryRunVerifier = resource.NewDryRunVerifier(dynamicClient, discoveryClient)
 
 	o.Namespace, o.EnforceNamespace, err = f.ToRawKubeConfigLoader().Namespace()
 	if err != nil {
@@ -231,7 +244,7 @@ func (o *ServiceClusterIPOpts) Run() error {
 			}
 			createOptions.DryRun = []string{metav1.DryRunAll}
 		}
-		service, err = o.Client.Service(o.Namespace).Create(context.TODO(), service, createOptions)
+		service, err = o.Client.Services(o.Namespace).Create(context.TODO(), service, createOptions)
 		if err != nil {
 			return fmt.Errorf("failed to create service: %v", err)
 		}
@@ -239,21 +252,21 @@ func (o *ServiceClusterIPOpts) Run() error {
 	return o.PrintObj(service)
 }
 
-func (o *ServiceClusterIPOpts) createService() (*corev1.Service, error) {
+func (o *ServiceClusterIPOpts) createService() (*v1.Service, error) {
 	namespace := ""
 	if o.EnforceNamespace {
 		namespace = o.Namespace
 	}
-	service := &corev1.Service{
-		TypeMeta: metav1.TypeMeta{APIVersion: corev1.SchemeGroupVersion.String(), Kind: "Service"},
+	service := v1.Service{
+		TypeMeta: metav1.TypeMeta{APIVersion: v1.SchemeGroupVersion.String(), Kind: "Service"},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   o.name,
+			Name:   o.Name,
 			Namespace: namespace,
-			Labels: o.labels,
+			Labels: o.Labels,
 		},
-		Spec: &corev1.ServiceSpec{
-			Selector: o.selector,
-			Ports:    o.ports,
+		Spec: v1.ServiceSpec{
+			Selector: o.Selector,
+			Ports:    o.Ports,
 		},
 	}
 
@@ -284,30 +297,30 @@ func (o *ServiceClusterIPOpts) createService() (*corev1.Service, error) {
 		service.Spec.ExternalIPs = []string{o.ExternalIP}
 	}
 	if len(o.Type) != 0 {
-		service.Spec.Type = &corev1.ServiceType(o.Type)
+		service.Spec.Type = v1.ServiceType(o.Type)
 	}
-	if service.Spec.Type == &corev1.ServiceTypeLoadBalancer {
+	if service.Spec.Type == v1.ServiceTypeLoadBalancer {
 		service.Spec.LoadBalancerIP = o.LoadBalancerIP
 	}
 	if len(o.SessionAffinity) != 0 {
-		switch &corev1.ServiceAffinity(o.SessionAffinity) {
-		case &corev1.ServiceAffinityNone:
-			service.Spec.SessionAffinity = &corev1.ServiceAffinityNone
-		case &corev1.ServiceAffinityClientIP:
-			service.Spec.SessionAffinity = &corev1.ServiceAffinityClientIP
+		switch v1.ServiceAffinity(o.SessionAffinity) {
+		case v1.ServiceAffinityNone:
+			service.Spec.SessionAffinity = v1.ServiceAffinityNone
+		case v1.ServiceAffinityClientIP:
+			service.Spec.SessionAffinity = v1.ServiceAffinityClientIP
 		default:
 			return nil, fmt.Errorf("unknown session affinity: %s", o.SessionAffinity)
 		}
 	}
 	if len(o.ClusterIP) != 0 {
 		if o.ClusterIP == "None" {
-			service.Spec.ClusterIP = &corev1.ClusterIPNone
+			service.Spec.ClusterIP = v1.ClusterIPNone
 		} else {
 			service.Spec.ClusterIP = o.ClusterIP
 		}
 	}
 
-	return service, nil
+	return &service, nil
 }
 
 var (
