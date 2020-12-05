@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	
 	"github.com/spf13/cobra"
 
@@ -32,6 +33,8 @@ import (
 	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/validation"
+	utilsnet "k8s.io/utils/net"
 	"k8s.io/kubectl/pkg/scheme"
 	"k8s.io/kubectl/pkg/util"
 	"k8s.io/kubectl/pkg/util/i18n"
@@ -74,34 +77,17 @@ func addPortFlags(cmd *cobra.Command) {
 }
 
 // ServiceClusterIPOpts holds the options for 'create service clusterip' sub command
-type ServiceClusterIPOpts struct {
+type ServiceCommon struct {
 	// PrintFlags holds options necessary for obtaining a printer
-	PrintFlags *genericclioptions.PrintFlags
+    PrintFlags *genericclioptions.PrintFlags
 	PrintObj   func(obj runtime.Object) error
 	// Name of resource being created
 	Name             string
-	DefaultName      string
-	Selector         map[string]string
-	// Port will be used if a user specifies --port OR the exposed object
-	// has one port
-	Port             string
-	// Ports will be used if a user doesn't specify --port AND the
-	// exposed object has multiple ports
-	Ports            []v1.ServicePort
-	Labels           map[string]string
-	ExternalIP       string
-	LoadBalancerIP   string
-	Type             string
-	Protocol         string
-	// protocols will be used to keep port-protocol mapping derived from
-	// exposed object
-	Protocols        string
-	// alias of TargetPort
-	ContainerPort    string
-	TargetPort       string
-	PortName         string
-	SessionAffinity  string
-	ClusterIP        string
+	TCP          []string
+	Type         v1.ServiceType
+	ClusterIP    string
+	NodePort     int
+	ExternalName string
 	
 	DryRunStrategy   cmdutil.DryRunStrategy
 	DryRunVerifier   *resource.DryRunVerifier
@@ -113,16 +99,25 @@ type ServiceClusterIPOpts struct {
 
 	Mapper meta.RESTMapper
 	Client *coreclient.CoreV1Client
-
+	
 	genericclioptions.IOStreams
+
+	
+}
+
+// ServiceClusterIPOpts holds the options for 'create service clusterip' sub command
+type ServiceClusterIPOpts struct {
+     ServiceCommon   
 }
 
 // NewServiceClusterIPOpts creates a new *ServiceClusterIPOpts with sane defaults
 func NewServiceClusterIPOpts(ioStreams genericclioptions.IOStreams) *ServiceClusterIPOpts {
 	return &ServiceClusterIPOpts{
-		PrintFlags: genericclioptions.NewPrintFlags("created").WithTypeSetter(scheme.Scheme),
-		IOStreams:  ioStreams,
-	}
+		ServiceCommon{
+			PrintFlags: genericclioptions.NewPrintFlags("created").WithTypeSetter(scheme.Scheme),
+			IOStreams: ioStreams,
+		},
+		}
 }
 
 // NewCmdCreateServiceClusterIP is a command to create a ClusterIP service
@@ -165,6 +160,9 @@ func (o *ServiceClusterIPOpts) Complete(f cmdutil.Factory, cmd *cobra.Command, a
 		return err
 	}
 
+	o.TCP = cmdutil.GetFlagStringSlice(cmd, "tcp")
+	o.Type = v1.ServiceTypeClusterIP
+	o.ClusterIP = cmdutil.GetFlagString(cmd, "clusterip")
 
 	restConfig, err := f.ToRESTConfig()
 	if err != nil {
@@ -211,19 +209,30 @@ func (o *ServiceClusterIPOpts) Complete(f cmdutil.Factory, cmd *cobra.Command, a
 }
 
 // Validate checks to the ServiceClusterIPOpts to see if there is sufficient information run the command.
-func (o *ServiceClusterIPOpts) Validate() error {
+func (o *ServiceCommon) Validate() error {
 	if len(o.Name) == 0 {
 		return fmt.Errorf("name must be specified")
 	}
 	
-	if len(o.Selector) == 0 {
-		return fmt.Errorf("'selector' is a required parameter")
+	if len(o.Type) == 0 {
+		return fmt.Errorf("type must be specified")
+	}
+	if o.ClusterIP == v1.ClusterIPNone && o.Type != v1.ServiceTypeClusterIP {
+		return fmt.Errorf("ClusterIP=None can only be used with ClusterIP service type")
+	}
+	if o.ClusterIP != v1.ClusterIPNone && len(o.TCP) == 0 && o.Type != v1.ServiceTypeExternalName {
+		return fmt.Errorf("at least one tcp port specifier must be provided")
+	}
+	if o.Type == v1.ServiceTypeExternalName {
+		if errs := validation.IsDNS1123Subdomain(o.ExternalName); len(errs) != 0 {
+			return fmt.Errorf("invalid service external name %s", o.ExternalName)
+		}
 	}
 	return nil
 }
 
 // Run calls the CreateSubcommandOptions.Run in ServiceClusterIPOpts instance
-func (o *ServiceClusterIPOpts) Run() error {
+func (o *ServiceCommon) Run() error {
 	service, err := o.createService()
 	if err != nil {
 		return err
@@ -252,72 +261,77 @@ func (o *ServiceClusterIPOpts) Run() error {
 	return o.PrintObj(service)
 }
 
-func (o *ServiceClusterIPOpts) createService() (*v1.Service, error) {
+func parsePorts(portString string) (int32, intstr.IntOrString, error) {
+	portStringSlice := strings.Split(portString, ":")
+
+	port, err := utilsnet.ParsePort(portStringSlice[0], true)
+	if err != nil {
+		return 0, intstr.FromInt(0), err
+	}
+
+	if len(portStringSlice) == 1 {
+		return int32(port), intstr.FromInt(int(port)), nil
+	}
+
+	var targetPort intstr.IntOrString
+	if portNum, err := strconv.Atoi(portStringSlice[1]); err != nil {
+		if errs := validation.IsValidPortName(portStringSlice[1]); len(errs) != 0 {
+			return 0, intstr.FromInt(0), fmt.Errorf(strings.Join(errs, ","))
+		}
+		targetPort = intstr.FromString(portStringSlice[1])
+	} else {
+		if errs := validation.IsValidPortNum(portNum); len(errs) != 0 {
+			return 0, intstr.FromInt(0), fmt.Errorf(strings.Join(errs, ","))
+		}
+		targetPort = intstr.FromInt(portNum)
+	}
+	return int32(port), targetPort, nil
+}
+
+func (o *ServiceCommon) createService() (*v1.Service, error) {
 	namespace := ""
 	if o.EnforceNamespace {
 		namespace = o.Namespace
 	}
+
+	ports := []v1.ServicePort{}
+	for _, tcpString := range o.TCP {
+		port, targetPort, err := parsePorts(tcpString)
+		if err != nil {
+			return nil, err
+		}
+
+		portName := strings.Replace(tcpString, ":", "-", -1)
+		ports = append(ports, v1.ServicePort{
+			Name:       portName,
+			Port:       port,
+			TargetPort: targetPort,
+			Protocol:   v1.Protocol("TCP"),
+			NodePort:   int32(o.NodePort),
+		})
+	}
+
+	// setup default label and selector
+	labels := map[string]string{}
+	labels["app"] = o.Name
+	selector := map[string]string{}
+	selector["app"] = o.Name
+
 	service := v1.Service{
-		TypeMeta: metav1.TypeMeta{APIVersion: v1.SchemeGroupVersion.String(), Kind: "Service"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   o.Name,
 			Namespace: namespace,
-			Labels: o.Labels,
+			Labels: labels,
 		},
 		Spec: v1.ServiceSpec{
-			Selector: o.Selector,
-			Ports:    o.Ports,
+			Type:         v1.ServiceType(o.Type),
+			Selector:     selector,
+			Ports:        ports,
+			ExternalName: o.ExternalName,
 		},
 	}
-
-	targetPortString := o.TargetPort
-	if len(targetPortString) == 0 {
-		targetPortString = o.ContainerPort
-	}
-	if len(targetPortString) > 0 {
-		var targetPort intstr.IntOrString
-		if portNum, err := strconv.Atoi(targetPortString); err != nil {
-			targetPort = intstr.FromString(targetPortString)
-		} else {
-			targetPort = intstr.FromInt(portNum)
-		}
-		// Use the same target-port for every port
-		for i := range service.Spec.Ports {
-			service.Spec.Ports[i].TargetPort = targetPort
-		}
-	} else {
-		// If --target-port or --container-port haven't been specified, this
-		// should be the same as Port
-		for i := range service.Spec.Ports {
-			port := service.Spec.Ports[i].Port
-			service.Spec.Ports[i].TargetPort = intstr.FromInt(int(port))
-		}
-	}
-	if len(o.ExternalIP) > 0 {
-		service.Spec.ExternalIPs = []string{o.ExternalIP}
-	}
-	if len(o.Type) != 0 {
-		service.Spec.Type = v1.ServiceType(o.Type)
-	}
-	if service.Spec.Type == v1.ServiceTypeLoadBalancer {
-		service.Spec.LoadBalancerIP = o.LoadBalancerIP
-	}
-	if len(o.SessionAffinity) != 0 {
-		switch v1.ServiceAffinity(o.SessionAffinity) {
-		case v1.ServiceAffinityNone:
-			service.Spec.SessionAffinity = v1.ServiceAffinityNone
-		case v1.ServiceAffinityClientIP:
-			service.Spec.SessionAffinity = v1.ServiceAffinityClientIP
-		default:
-			return nil, fmt.Errorf("unknown session affinity: %s", o.SessionAffinity)
-		}
-	}
-	if len(o.ClusterIP) != 0 {
-		if o.ClusterIP == "None" {
-			service.Spec.ClusterIP = v1.ClusterIPNone
-		} else {
-			service.Spec.ClusterIP = o.ClusterIP
-		}
+	if len(o.ClusterIP) > 0 {
+		service.Spec.ClusterIP = o.ClusterIP
 	}
 
 	return &service, nil
